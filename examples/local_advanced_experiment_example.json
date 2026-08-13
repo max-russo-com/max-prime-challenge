@@ -1,0 +1,15 @@
+{
+  "experiment_id": "LOCAL-ADVANCED-001",
+  "n0": "12345678901234567890",
+  "step": "1",
+  "iterations": 300,
+  "test_n": true,
+  "test_d": false,
+  "filter": {
+    "enabled": false,
+    "modulus_m": "1",
+    "remainder_r": "0",
+    "original_moduli": [],
+    "original_remainders": []
+  }
+}

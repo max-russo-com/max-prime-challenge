@@ -1,0 +1,18 @@
+[package]
+name = "max_prime_challenge"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+rand = "0.8"
+dashu-int = "0.4.2"
+
+ureq = { version = "2.10", features = ["json"] }
+eframe = "0.33"
+rfd = "0.17"
+qrcode = "0.14"
+url = "2"

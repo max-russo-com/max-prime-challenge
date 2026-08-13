@@ -1,0 +1,53 @@
+# Rust build artifacts
+/target/
+
+# Local client state and private runtime data
+/app_state/
+/server_client_runs/
+
+# Local/generated challenge data
+/work_units/
+/results/
+/verification_bundles/
+/exports/
+/backups/
+/checkpoints/
+/logs/
+/reports/
+/inspections/
+/audits/
+/discoveries/
+/admin_staging/
+/_PRIVATE_NOT_FOR_GITHUB/
+/src_backups/
+/_LOCAL_BACKUPS_NOT_FOR_GITHUB/
+
+# macOS / editor / temporary files
+.DS_Store
+.AppleDouble
+.LSOverride
+*~
+*.tmp
+*.swp
+*.swo
+*.orig
+*.bak
+*.backup
+*.BEFORE_*
+
+# Secrets and private configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+
+# Generated audit/report text
+*_REPORT_*.txt
+GITHUB_EXPORT_INSPECTION_*.txt
+
+# Private/admin manifest generation tool
+/tools/create_max_prime_manifest.sh

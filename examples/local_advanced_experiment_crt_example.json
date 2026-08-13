@@ -1,0 +1,19 @@
+{
+  "experiment_id": "LOCAL-ADVANCED-CRT-001",
+  "n0": "12345678901234567890",
+  "step": "1",
+  "iterations": 300,
+  "test_n": true,
+  "test_d": false,
+  "filter": {
+    "enabled": true,
+    "modulus_m": "59",
+    "remainder_r": "2",
+    "original_moduli": [
+      "59"
+    ],
+    "original_remainders": [
+      "2"
+    ]
+  }
+}

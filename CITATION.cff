@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "MAX Prime Challenge"
+message: "If you use or discuss this software, please cite the MAX Prime Challenge repository and the author."
+type: software
+authors:
+  - family-names: "Russo"
+    given-names: "Massimo"
+repository-code: "https://github.com/max-russo-com/max-prime-challenge"
+url: "https://github.com/max-russo-com/max-prime-challenge"
+license: "proprietary"
+abstract: "Rust public client and GUI for the MAX Prime Challenge, a source-available structured probable-prime search workflow with local/demo and official participation modes."
+keywords:
+  - "prime numbers"
+  - "probable primes"
+  - "Rust"
+  - "distributed computing"
+  - "MAX Prime Challenge"

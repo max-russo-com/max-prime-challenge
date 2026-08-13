@@ -1,0 +1,21 @@
+{
+  "campaign_id": "MPC-LOCAL-001",
+  "n0": "1000000",
+  "step": "1",
+  "total_iterations": 1000,
+  "package_size": 100,
+  "test_n": true,
+  "test_d": false,
+  "filter": {
+    "kind": "crt",
+    "moduli": [
+      "31",
+      "7",
+      "37",
+      "101"
+    ],
+    "remainders": [
+      "3"
+    ]
+  }
+}

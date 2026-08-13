@@ -1,0 +1,58 @@
+MAX PRIME CHALLENGE SOURCE-AVAILABLE LICENSE
+
+Copyright (c) Massimo Russo.
+All rights reserved unless expressly granted below.
+
+This repository is published to allow public inspection, technical review, local compilation, local experimentation, security review, and participation in the official MAX Prime Challenge flow.
+
+1. Granted permissions
+
+You may:
+
+* read and inspect the source code;
+* compile and run the software for personal use, technical review, security review, local experimentation, and educational purposes;
+* use the software to participate in the official MAX Prime Challenge flow;
+* reproduce local/demo results, provided they are not represented as official MAX Prime Challenge results unless accepted by the official server flow;
+* quote, reference, discuss, and review the project with attribution.
+
+2. Restrictions
+
+You may not, without prior written permission from Massimo Russo:
+
+* operate, host, or promote a competing public challenge service based on this code or on substantially similar branding, workflow, or public challenge infrastructure;
+* remove or obscure attribution to MAX Prime Challenge or Massimo Russo;
+* sell, sublicense, rent, or commercially redistribute this code as a standalone product;
+* use MAX, MAX Prime Challenge, MAX Login, MAX App, MX2, MX², or related names, marks, logos, or branding in a way that implies endorsement or official status;
+* represent unofficial, modified, local, or third-party results as official MAX Prime Challenge results;
+* bypass, disable, or misrepresent official authentication, assignment, participant identity, server verification, or hit verification rules;
+* use this code to attack, overload, scrape, impersonate, or abuse official MAX Prime Challenge, MAX Login, MAX App, or related infrastructure.
+
+3. Official results
+
+Official MAX Prime Challenge results are determined only by the official server, assignment, submission, and verification flow.
+
+A local run, local hit, local JSON export, or modified client output is not an official result unless accepted and verified by the official MAX Prime Challenge infrastructure.
+
+Current primality checks are probable-prime checks unless explicitly stated otherwise. Public claims must not describe probable primes as definitive mathematical certifications.
+
+4. Third-party dependencies
+
+Third-party Rust crates and other dependencies remain under their own licenses.
+
+See `THIRD_PARTY_LICENSES.md` and `LICENSE_AUDIT_NOTES.md` where available.
+
+This license applies only to the original MAX Prime Challenge code and materials published in this repository, not to third-party components.
+
+5. No warranty
+
+This software is provided "as is", without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, non-infringement, correctness, availability, or security.
+
+You use this software at your own risk.
+
+6. Contact
+
+For licensing, permission, security, or official challenge questions, contact Massimo Russo through the official MAX project channels.
+
+Official website: https://www.max-russo.com
+
+Repository: https://github.com/max-russo-com/max-prime-challenge
