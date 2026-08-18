@@ -96,17 +96,26 @@ The CLI is the best starting point for technical users who want to inspect the p
 
 The GUI is intended for a cleaner user experience, especially for official participation workflows and exporting official winning hit data.
 
-Typical CLI build:
+For normal GUI use and official participation, use the full build:
+
+    cargo build --release
+
+This builds both:
+
+    target/release/max_prime_public_gui
+    target/release/max_prime_public_client
+
+The GUI uses `max_prime_public_client` internally for some official participation functions, including **MAX Login**. For that reason, compiling only the GUI binary is not sufficient for the complete official GUI workflow.
+
+CLI-only build, for terminal-only use:
 
     cargo build --release --bin max_prime_public_client
 
-Typical GUI build:
+GUI-only build, for development or limited GUI testing:
 
     cargo build --release --bin max_prime_public_gui
 
-Full build:
-
-    cargo build --release --bin max_prime_public_client --bin max_prime_public_gui
+If you want to use MAX Login or participate officially through the GUI, use the full build instead.
 
 ---
 
@@ -292,21 +301,19 @@ Clone the repository:
     git clone https://github.com/max-russo-com/max-prime-challenge.git
     cd max-prime-challenge
 
-Build the CLI:
+Build the complete project:
 
-    cargo build --release --bin max_prime_public_client
-
-Run the CLI:
-
-    ./target/release/max_prime_public_client
-
-Build the GUI:
-
-    cargo build --release --bin max_prime_public_gui
+    cargo build --release
 
 Run the GUI:
 
     ./target/release/max_prime_public_gui
+
+The full build is recommended for GUI use because the GUI invokes the CLI client internally for functions such as MAX Login.
+
+Run the CLI directly, if preferred:
+
+    ./target/release/max_prime_public_client
 
 ---
 
