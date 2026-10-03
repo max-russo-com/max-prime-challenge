@@ -1,5 +1,9 @@
+#[cfg(test)]
+use dashu_int::ops::BitTest;
 use dashu_int::UBig;
 use rand::Rng;
+#[cfg(test)]
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -859,6 +863,65 @@ fn run_advanced_local(config_path: &str) -> Result<(), String> {
     let mut expected_d_primes: f64 = 0.0;
     let mut observed_d_primes: usize = 0;
 
+    // Motore privato opzionale.
+    // Mantiene intatti stato, progressi ed esportazioni.
+    let private_advanced_optimized = true;
+
+    let first_effective = if resolved_filter.enabled {
+        &remainder_r + &modulus_m * &n0
+    } else {
+        n0.clone()
+    };
+
+    let effective_step = if resolved_filter.enabled {
+        &modulus_m * &step
+    } else {
+        step.clone()
+    };
+
+    // Il crivello conviene soprattutto sui pacchetti grandi.
+    // Con filtri arbitrari non saltiamo alcun modulo.
+    let use_private_sieve = private_advanced_optimized
+        && cfg.test_n
+        && cfg.iterations >= 25
+        && cfg.iterations <= 200_000
+        && decimal_digits(&n_candidate_from_n(&first_effective)) >= 100;
+
+    let (private_n_mask, mut private_n_cursor) = if use_private_sieve {
+        let primes = crtcomp_primes_up_to(if cfg.iterations < 500 {
+            500_000
+        } else {
+            5_000_000
+        });
+
+        let schedule = crtcomp_compile_schedule(&primes, &effective_step, false);
+
+        let mut persistent = crtcomp_initialize_persistent_state(&first_effective, &schedule);
+
+        let mask = crtcomp_mark_persistent(cfg.iterations, &schedule, &mut persistent);
+
+        (
+            Some(mask),
+            Some(CrtCompCandidateCursor::new(
+                &first_effective,
+                &effective_step,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
+    println!(
+        "MAX optimized engine: {}",
+        if private_advanced_optimized {
+            "OPTIMIZED"
+        } else {
+            "LEGACY"
+        }
+    );
+
+    println!("MAX structural sieve: {}", use_private_sieve);
+
     for i in 0..cfg.iterations {
         let n_raw = &n0 + (&step * UBig::from(i as u64));
 
@@ -869,11 +932,27 @@ fn run_advanced_local(config_path: &str) -> Result<(), String> {
         };
 
         if cfg.test_n {
-            let candidate = n_candidate_from_n(&n_effective);
+            let private_rejected = private_n_mask.as_ref().map(|mask| mask[i]).unwrap_or(false);
+
+            // Conserviamo il conteggio originale delle cifre.
+            // Evitiamo MR sui candidati scartati dal crivello.
+            let candidate = if private_rejected {
+                n_candidate_from_n(&n_effective)
+            } else if let Some(cursor) = private_n_cursor.as_mut() {
+                cursor.at(i).clone()
+            } else {
+                n_candidate_from_n(&n_effective)
+            };
             let digits = decimal_digits(&candidate);
             expected_n_primes += expected_prime_probability_from_digits(digits);
 
-            if is_probable_prime(&candidate) {
+            if !private_rejected
+                && if private_advanced_optimized {
+                    is_probable_prime_ring_max(&candidate)
+                } else {
+                    is_probable_prime(&candidate)
+                }
+            {
                 observed_n_primes += 1;
                 let sha = sha256_decimal(&candidate);
 
@@ -909,7 +988,11 @@ fn run_advanced_local(config_path: &str) -> Result<(), String> {
             let digits = decimal_digits(&candidate);
             expected_d_primes += expected_prime_probability_from_digits(digits);
 
-            if is_probable_prime(&candidate) {
+            if if private_advanced_optimized {
+                is_probable_prime_ring_general(&candidate)
+            } else {
+                is_probable_prime(&candidate)
+            } {
                 observed_d_primes += 1;
                 let sha = sha256_decimal(&candidate);
 
@@ -2571,7 +2654,8 @@ fn official_make_client_id(challenge_id: &str) -> String {
     format!("mpc-public-{}", &hex[..24])
 }
 
-fn official_compute_work_unit_payload(
+#[cfg(test)]
+fn official_compute_work_unit_payload_legacy(
     get_response: &serde_json::Value,
     cfg: &OfficialClientConfig,
 ) -> Result<serde_json::Value, String> {
@@ -2826,6 +2910,323 @@ fn official_compute_work_unit_payload(
     });
 
     Ok(payload)
+}
+
+fn official_compute_work_unit_payload_optimized(
+    get_response: &serde_json::Value,
+    cfg: &OfficialClientConfig,
+) -> Result<serde_json::Value, String> {
+    let assignment = get_response
+        .get("assignment")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "Missing assignment object in get-work response.".to_string())?;
+
+    let work_unit = get_response
+        .get("work_unit")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "Missing work_unit object in get-work response.".to_string())?;
+
+    let assignment_id = assignment
+        .get("assignment_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing assignment.assignment_id.".to_string())?
+        .to_string();
+
+    let assignment_token = assignment
+        .get("assignment_token")
+        .or_else(|| get_response.get("assignment_token"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "Missing assignment_token in get-work response. Authenticated submit cannot continue."
+                .to_string()
+        })?
+        .to_string();
+
+    let client_id = cfg.client_device_id.clone();
+
+    let challenge_id = work_unit
+        .get("challenge_id")
+        .or_else(|| work_unit.get("campaign_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing work_unit.challenge_id/campaign_id.".to_string())?
+        .to_string();
+
+    let campaign_id = work_unit
+        .get("campaign_id")
+        .or_else(|| work_unit.get("challenge_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing work_unit.campaign_id/challenge_id.".to_string())?
+        .to_string();
+
+    let work_unit_id =
+        official_json_get_string(get_response.get("work_unit").unwrap(), "work_unit_id")?;
+    let work_unit_index =
+        official_json_get_usize(get_response.get("work_unit").unwrap(), "work_unit_index")?;
+    let n0_s = official_json_get_string(get_response.get("work_unit").unwrap(), "n0")?;
+    let step_s = official_json_get_string(get_response.get("work_unit").unwrap(), "step")?;
+    let start_i = official_json_get_usize(get_response.get("work_unit").unwrap(), "start_i")?;
+    let iterations = official_json_get_usize(get_response.get("work_unit").unwrap(), "iterations")?;
+    let test_n = official_json_get_bool(get_response.get("work_unit").unwrap(), "test_n")?;
+    let test_d = official_json_get_bool(get_response.get("work_unit").unwrap(), "test_d")?;
+
+    if !test_n && !test_d {
+        return Err("Official work unit has both test_n=false and test_d=false.".to_string());
+    }
+
+    let filter_value = get_response
+        .get("work_unit")
+        .and_then(|v| v.get("filter"))
+        .ok_or_else(|| "Missing work_unit.filter.".to_string())?;
+
+    let filter_enabled = official_json_get_bool(filter_value, "enabled")?;
+    let modulus_m_s = official_json_get_string(filter_value, "modulus_m")?;
+    let remainder_r_s = official_json_get_string(filter_value, "remainder_r")?;
+
+    let n0 = official_parse_ubig("n0", &n0_s)?;
+    let step = official_parse_ubig("step", &step_s)?;
+    let modulus_m = official_parse_ubig("filter.modulus_m", &modulus_m_s)?;
+    let remainder_r = official_parse_ubig("filter.remainder_r", &remainder_r_s)?;
+
+    let t0 = std::time::Instant::now();
+
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    let mut n_primes_found: usize = 0;
+    let mut d_primes_found: usize = 0;
+    let mut n_expected_sum = 0.0_f64;
+    let mut d_expected_sum = 0.0_f64;
+    let mut n_digit_counts: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    let mut d_digit_counts: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+
+    // Motore privato sperimentale.
+    // CRT arbitrario: non si presume SAFECRT50.
+    // Per pacchetti piccoli evitiamo il setup del crivello.
+
+    let first_raw = &n0 + &step * UBig::from(start_i as u64);
+
+    let effective_start = if filter_enabled {
+        &remainder_r + &modulus_m * &first_raw
+    } else {
+        first_raw
+    };
+
+    let effective_step = if filter_enabled {
+        &modulus_m * &step
+    } else {
+        step.clone()
+    };
+
+    let use_sieve = test_n
+        && iterations >= 25
+        && iterations <= 200_000
+        && decimal_digits(&n_candidate_from_n(&effective_start)) >= 100;
+
+    let (n_mask, mut n_cursor) = if use_sieve {
+        let primes = crtcomp_primes_up_to(if iterations < 500 { 500_000 } else { 5_000_000 });
+
+        let schedule = crtcomp_compile_schedule(&primes, &effective_step, false);
+
+        let mut state = crtcomp_initialize_persistent_state(&effective_start, &schedule);
+
+        let mask = crtcomp_mark_persistent(iterations, &schedule, &mut state);
+
+        (
+            Some(mask),
+            Some(CrtCompCandidateCursor::new(
+                &effective_start,
+                &effective_step,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
+    for offset in 0..iterations {
+        let i = start_i + offset;
+        let n_raw = &n0 + (&step * UBig::from(i as u64));
+        let n_effective = if filter_enabled {
+            &remainder_r + (&modulus_m * &n_raw)
+        } else {
+            n_raw.clone()
+        };
+
+        if test_n {
+            let rejected = n_mask.as_ref().map(|mask| mask[offset]).unwrap_or(false);
+
+            // Manteniamo le statistiche originali anche
+            // quando il crivello scarta un candidato.
+            let candidate = if rejected {
+                n_candidate_from_n(&n_effective)
+            } else if let Some(cursor) = n_cursor.as_mut() {
+                cursor.at(offset).clone()
+            } else {
+                n_candidate_from_n(&n_effective)
+            };
+            let digits = decimal_digits(&candidate);
+            n_expected_sum += expected_prime_probability_from_digits(digits);
+            *n_digit_counts.entry(digits).or_insert(0) += 1;
+
+            if !rejected && is_probable_prime_ring_max(&candidate) {
+                n_primes_found += 1;
+                let sha = sha256_decimal(&candidate);
+                hits.push(serde_json::json!({
+                    "candidate_type": "N",
+                    "i": i,
+                    "n_raw": n_raw.to_string(),
+                    "n_effective": n_effective.to_string(),
+                    "candidate": candidate.to_string(),
+                    "digits": digits,
+                    "sha256": sha
+                }));
+            }
+        }
+
+        if test_d {
+            let candidate = d_candidate_from_n(&n_effective);
+            let digits = decimal_digits(&candidate);
+            d_expected_sum += expected_prime_probability_from_digits(digits);
+            *d_digit_counts.entry(digits).or_insert(0) += 1;
+
+            if is_probable_prime_ring_general(&candidate) {
+                d_primes_found += 1;
+                let sha = sha256_decimal(&candidate);
+                hits.push(serde_json::json!({
+                    "candidate_type": "d",
+                    "i": i,
+                    "n_raw": n_raw.to_string(),
+                    "n_effective": n_effective.to_string(),
+                    "candidate": candidate.to_string(),
+                    "digits": digits,
+                    "sha256": sha
+                }));
+            }
+        }
+    }
+
+    let elapsed_s = t0.elapsed().as_secs_f64();
+    let iterations_done = iterations;
+    let total_primes = n_primes_found + d_primes_found;
+
+    let n_expected_pct = if iterations_done > 0 {
+        100.0 * n_expected_sum / iterations_done as f64
+    } else {
+        0.0
+    };
+    let d_expected_pct = if iterations_done > 0 {
+        100.0 * d_expected_sum / iterations_done as f64
+    } else {
+        0.0
+    };
+    let combined_expected_sum = n_expected_sum + d_expected_sum;
+    let combined_expected_pct = if iterations_done > 0 {
+        100.0 * combined_expected_sum / iterations_done as f64
+    } else {
+        0.0
+    };
+
+    let n_observed_pct = if iterations_done > 0 {
+        100.0 * n_primes_found as f64 / iterations_done as f64
+    } else {
+        0.0
+    };
+    let d_observed_pct = if iterations_done > 0 {
+        100.0 * d_primes_found as f64 / iterations_done as f64
+    } else {
+        0.0
+    };
+    let combined_observed_pct = if iterations_done > 0 {
+        100.0 * total_primes as f64 / iterations_done as f64
+    } else {
+        0.0
+    };
+
+    let n_enrichment = if n_expected_sum > 0.0 {
+        n_primes_found as f64 / n_expected_sum
+    } else {
+        0.0
+    };
+    let d_enrichment = if d_expected_sum > 0.0 {
+        d_primes_found as f64 / d_expected_sum
+    } else {
+        0.0
+    };
+    let combined_enrichment = if combined_expected_sum > 0.0 {
+        total_primes as f64 / combined_expected_sum
+    } else {
+        0.0
+    };
+
+    let n_candidates_by_digits: Vec<serde_json::Value> = n_digit_counts
+        .into_iter()
+        .map(|(digits, count)| serde_json::json!({ "digits": digits, "count": count }))
+        .collect();
+
+    let d_candidates_by_digits: Vec<serde_json::Value> = d_digit_counts
+        .into_iter()
+        .map(|(digits, count)| serde_json::json!({ "digits": digits, "count": count }))
+        .collect();
+
+    let stats = serde_json::json!({
+        "n_primes_found": n_primes_found,
+        "d_primes_found": d_primes_found,
+        "n_expected_pct": n_expected_pct,
+        "d_expected_pct": d_expected_pct,
+        "combined_expected_pct": combined_expected_pct,
+        "n_observed_pct": n_observed_pct,
+        "d_observed_pct": d_observed_pct,
+        "combined_observed_pct": combined_observed_pct,
+        "n_enrichment": n_enrichment,
+        "d_enrichment": d_enrichment,
+        "combined_enrichment": combined_enrichment,
+        "n_candidates_by_digits": n_candidates_by_digits,
+        "d_candidates_by_digits": d_candidates_by_digits
+    });
+
+    let result = serde_json::json!({
+        "ok": true,
+        "campaign_id": campaign_id,
+        "work_unit_id": work_unit_id,
+        "iterations_done": iterations_done,
+        "elapsed_s": elapsed_s,
+        "hits": hits,
+        "stats": stats
+    });
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "challenge_id": challenge_id,
+        "work_unit_id": work_unit_id,
+        "work_unit_index": work_unit_index.to_string(),
+        "assignment_id": assignment_id,
+        "assignment_token": assignment_token,
+        "client_id": client_id,
+        "client_device_id": cfg.client_device_id,
+        "participant_id": cfg.participant_id,
+        "participant_token": cfg.participant_token,
+        "client_engine": {
+            "name": "max_prime_public_client",
+            "mode": "official-run-once",
+            "math_engine": "dashu-int",
+            "bigint_note": "Public client uses dashu-int for official work computation.",
+            "probable_prime_note": "Miller-Rabin probable-prime test, not final public certification."
+        },
+        "iterations_done": iterations_done,
+        "elapsed_s": elapsed_s,
+        "hits": result.get("hits").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "stats": result.get("stats").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "result": result,
+        "result_json": result
+    });
+
+    Ok(payload)
+}
+
+fn official_compute_work_unit_payload(
+    get_response: &serde_json::Value,
+    cfg: &OfficialClientConfig,
+) -> Result<serde_json::Value, String> {
+    official_compute_work_unit_payload_optimized(get_response, cfg)
 }
 
 fn official_hit_summary_from_payload(
@@ -4074,6 +4475,762 @@ fn print_theory_note() {
     println!();
 }
 
+// Optimized structural sieve and persistent-offset engine.
+const CRTCOMP_SAFECRT50: [u64; 50] = [
+    31, 43, 59, 67, 71, 89, 101, 103, 107, 113, 149, 151, 167, 173, 181, 193, 211, 233, 239, 241,
+    251, 263, 269, 277, 283, 311, 353, 359, 367, 373, 383, 401, 433, 463, 479, 491, 509, 569, 571,
+    577, 599, 647, 661, 691, 701, 709, 733, 739, 743, 751,
+];
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct CrtCompArmStats {
+    rejected_before_build: usize,
+    built: usize,
+    entered_mr: usize,
+    hits: usize,
+    build_s: f64,
+    mr_s: f64,
+    total_s: f64,
+}
+
+fn crtcomp_pow_mod(mut base: u64, mut exp: u64, modu: u64) -> u64 {
+    if modu == 1 {
+        return 0;
+    }
+    let mut result = 1u64;
+    base %= modu;
+
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = ((result as u128 * base as u128) % modu as u128) as u64;
+        }
+        base = ((base as u128 * base as u128) % modu as u128) as u64;
+        exp >>= 1;
+    }
+    result
+}
+
+fn crtcomp_inv_mod(a: u64, p: u64) -> Option<u64> {
+    if p < 2 || a % p == 0 {
+        None
+    } else {
+        Some(crtcomp_pow_mod(a % p, p - 2, p))
+    }
+}
+
+fn crtcomp_legendre(a: u64, p: u64) -> u64 {
+    crtcomp_pow_mod(a % p, (p - 1) / 2, p)
+}
+
+fn crtcomp_tonelli_shanks(n: u64, p: u64) -> Option<u64> {
+    if p == 2 {
+        return Some(n & 1);
+    }
+
+    let n = n % p;
+    if n == 0 {
+        return Some(0);
+    }
+
+    if crtcomp_legendre(n, p) != 1 {
+        return None;
+    }
+
+    if p % 4 == 3 {
+        return Some(crtcomp_pow_mod(n, (p + 1) / 4, p));
+    }
+
+    let mut q = p - 1;
+    let mut s = 0u32;
+    while q % 2 == 0 {
+        q /= 2;
+        s += 1;
+    }
+
+    let mut z = 2u64;
+    while crtcomp_legendre(z, p) != p - 1 {
+        z += 1;
+    }
+
+    let mut c = crtcomp_pow_mod(z, q, p);
+    let mut x = crtcomp_pow_mod(n, (q + 1) / 2, p);
+    let mut t = crtcomp_pow_mod(n, q, p);
+    let mut m = s;
+
+    while t != 1 {
+        let mut i = 1u32;
+        let mut t2i = ((t as u128 * t as u128) % p as u128) as u64;
+
+        while i < m && t2i != 1 {
+            t2i = ((t2i as u128 * t2i as u128) % p as u128) as u64;
+            i += 1;
+        }
+
+        if i == m {
+            return None;
+        }
+
+        let b = crtcomp_pow_mod(c, 1u64 << (m - i - 1), p);
+        x = ((x as u128 * b as u128) % p as u128) as u64;
+        let b2 = ((b as u128 * b as u128) % p as u128) as u64;
+        t = ((t as u128 * b2 as u128) % p as u128) as u64;
+        c = b2;
+        m = i;
+    }
+
+    Some(x)
+}
+
+fn crtcomp_poly_mod(n: u64, p: u64) -> u64 {
+    let nn = n as u128;
+    ((31u128 + 6u128 * nn * (nn + 1u128)) % p as u128) as u64
+}
+
+fn crtcomp_bad_n_classes(p: u64) -> Vec<u64> {
+    if p <= 3 {
+        let mut out = Vec::new();
+        for n in 0..p {
+            if crtcomp_poly_mod(n, p) == 0 {
+                out.push(n);
+            }
+        }
+        return out;
+    }
+
+    // 6*N(n) = (6n+3)^2 + 177
+    let rhs = (p - (177 % p)) % p;
+    let Some(root) = crtcomp_tonelli_shanks(rhs, p) else {
+        return Vec::new();
+    };
+    let Some(inv6) = crtcomp_inv_mod(6 % p, p) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(2);
+
+    let a = ((root + p - (3 % p)) % p) as u128;
+    let n1 = ((a * inv6 as u128) % p as u128) as u64;
+    if crtcomp_poly_mod(n1, p) == 0 {
+        out.push(n1);
+    }
+
+    let root2 = if root == 0 { 0 } else { p - root };
+    let b = ((root2 + p - (3 % p)) % p) as u128;
+    let n2 = ((b * inv6 as u128) % p as u128) as u64;
+
+    if n2 != n1 && crtcomp_poly_mod(n2, p) == 0 {
+        out.push(n2);
+    }
+
+    out
+}
+
+fn crtcomp_primes_up_to(limit: usize) -> Vec<u64> {
+    if limit < 2 {
+        return Vec::new();
+    }
+
+    let mut composite = vec![false; limit + 1];
+    let mut p = 2usize;
+
+    while p * p <= limit {
+        if !composite[p] {
+            let mut k = p * p;
+            while k <= limit {
+                composite[k] = true;
+                k += p;
+            }
+        }
+        p += 1;
+    }
+
+    (2..=limit)
+        .filter(|&x| !composite[x])
+        .map(|x| x as u64)
+        .collect()
+}
+
+fn crtcomp_ubig_mod_u64(v: &UBig, p: u64) -> u64 {
+    u64::try_from(v % UBig::from(p)).expect("remainder must fit u64")
+}
+
+#[cfg(test)]
+fn crtcomp_ubig_mod_u64_legacy(v: &UBig, p: u64) -> u64 {
+    (v % UBig::from(p))
+        .to_string()
+        .parse::<u64>()
+        .expect("remainder must fit u64")
+}
+
+#[derive(Clone, Debug)]
+struct CrtCompScheduleEntry {
+    p: u64,
+    bad_classes: [u64; 2],
+    bad_class_count: u8,
+    step_mod: u64,
+    inv_step: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct CrtCompStructuralSchedule {
+    entries: Vec<CrtCompScheduleEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct CrtCompPersistentEntryState {
+    next_offsets: [usize; 2],
+}
+
+/// Mutable cursor state for one consecutive scan.  The compiled schedule stays
+/// immutable and can therefore be shared by independent scans.
+#[derive(Clone, Debug)]
+struct CrtCompPersistentState {
+    entries: Vec<CrtCompPersistentEntryState>,
+    reject_all: bool,
+}
+
+fn crtcomp_compile_schedule(
+    primes: &[u64],
+    step_n: &UBig,
+    skip_safecrt: bool,
+) -> CrtCompStructuralSchedule {
+    let mut entries = Vec::new();
+
+    for &p in primes {
+        // D is compiled without the SAFECRT50 moduli, so its hot marking loop
+        // never has to perform this membership test.
+        if skip_safecrt && CRTCOMP_SAFECRT50.contains(&p) {
+            continue;
+        }
+        let bad = crtcomp_bad_n_classes(p);
+        if bad.is_empty() {
+            continue;
+        }
+        debug_assert!(bad.len() <= 2);
+        let mut bad_classes = [0; 2];
+        bad_classes[..bad.len()].copy_from_slice(&bad);
+        let step_mod = crtcomp_ubig_mod_u64(step_n, p);
+        let inv_step = crtcomp_inv_mod(step_mod, p);
+        entries.push(CrtCompScheduleEntry {
+            p,
+            bad_classes,
+            bad_class_count: bad.len() as u8,
+            step_mod,
+            inv_step,
+        });
+    }
+
+    CrtCompStructuralSchedule { entries }
+}
+
+#[cfg(test)]
+fn crtcomp_safe_residue(p: u64) -> u64 {
+    for r in 0..p {
+        if crtcomp_poly_mod(r, p) != 0 {
+            return r;
+        }
+    }
+    panic!("No safe residue for prime {}", p);
+}
+
+#[cfg(test)]
+fn crtcomp_build_safecrt50() -> (UBig, UBig) {
+    // Costruzione CRT incrementale con M arbitrariamente grande ma p piccolo.
+    let mut m = UBig::from(1u32);
+    let mut r = UBig::from(0u32);
+
+    for p in CRTCOMP_SAFECRT50 {
+        let wanted = crtcomp_safe_residue(p);
+        let r_mod = crtcomp_ubig_mod_u64(&r, p);
+        let m_mod = crtcomp_ubig_mod_u64(&m, p);
+        let inv = crtcomp_inv_mod(m_mod, p).expect("SAFECRT50 moduli must be pairwise coprime");
+
+        let delta = (wanted + p - r_mod) % p;
+        let k = ((delta as u128 * inv as u128) % p as u128) as u64;
+
+        r = &r + &m * UBig::from(k);
+        m = &m * UBig::from(p);
+    }
+
+    (m, r)
+}
+
+#[cfg(test)]
+fn crtcomp_validate_safecrt50(m: &UBig, r: &UBig) -> Result<(), String> {
+    for p in CRTCOMP_SAFECRT50 {
+        if crtcomp_ubig_mod_u64(m, p) != 0 {
+            return Err(format!("CRT validation failed: M mod {} != 0", p));
+        }
+
+        let rr = crtcomp_ubig_mod_u64(r, p);
+        if crtcomp_poly_mod(rr, p) == 0 {
+            return Err(format!(
+                "CRT validation failed: selected residue is dead modulo {}",
+                p
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn crtcomp_mark_structural(
+    iterations: usize,
+    start_n: &UBig,
+    step_n: &UBig,
+    primes: &[u64],
+    skip_safecrt: bool,
+) -> Vec<bool> {
+    let schedule = crtcomp_compile_schedule(primes, step_n, skip_safecrt);
+    crtcomp_mark_compiled(iterations, start_n, &schedule)
+}
+
+#[cfg(test)]
+fn crtcomp_mark_compiled(
+    iterations: usize,
+    start_n: &UBig,
+    schedule: &CrtCompStructuralSchedule,
+) -> Vec<bool> {
+    let mut rejected = vec![false; iterations];
+
+    for entry in &schedule.entries {
+        let p = entry.p;
+        let bad = &entry.bad_classes[..entry.bad_class_count as usize];
+        let start_mod = crtcomp_ubig_mod_u64(start_n, p);
+
+        if entry.step_mod == 0 {
+            if bad.contains(&start_mod) {
+                rejected.fill(true);
+                return rejected;
+            }
+            continue;
+        }
+
+        let inv_step = entry
+            .inv_step
+            .expect("nonzero step modulo prime must be invertible");
+
+        for &bad_n in bad {
+            let delta = (bad_n + p - start_mod) % p;
+            let i0 = ((delta as u128 * inv_step as u128) % p as u128) as usize;
+
+            let stride = p as usize;
+            let mut i = i0;
+            while i < iterations {
+                rejected[i] = true;
+                i += stride;
+            }
+        }
+    }
+
+    rejected
+}
+
+fn crtcomp_initialize_persistent_state(
+    start_n: &UBig,
+    schedule: &CrtCompStructuralSchedule,
+) -> CrtCompPersistentState {
+    let mut reject_all = false;
+    let entries = schedule
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut next_offsets = [0usize; 2];
+            let bad = &entry.bad_classes[..entry.bad_class_count as usize];
+            let start_mod = crtcomp_ubig_mod_u64(start_n, entry.p);
+
+            if entry.step_mod == 0 {
+                reject_all |= bad.contains(&start_mod);
+            } else {
+                let inv_step = entry
+                    .inv_step
+                    .expect("nonzero step modulo prime must be invertible");
+                for (offset, &bad_n) in next_offsets.iter_mut().zip(bad) {
+                    let delta = (bad_n + entry.p - start_mod) % entry.p;
+                    *offset = ((delta as u128 * inv_step as u128) % entry.p as u128) as usize;
+                }
+            }
+            CrtCompPersistentEntryState { next_offsets }
+        })
+        .collect();
+
+    CrtCompPersistentState {
+        entries,
+        reject_all,
+    }
+}
+
+/// Marks the next consecutive window and advances every class cursor by the
+/// actual window length.  In particular, this does not assume equal segments.
+fn crtcomp_mark_persistent(
+    iterations: usize,
+    schedule: &CrtCompStructuralSchedule,
+    state: &mut CrtCompPersistentState,
+) -> Vec<bool> {
+    assert_eq!(schedule.entries.len(), state.entries.len());
+    if state.reject_all {
+        return vec![true; iterations];
+    }
+
+    let mut rejected = vec![false; iterations];
+    for (entry, entry_state) in schedule.entries.iter().zip(&mut state.entries) {
+        if entry.step_mod == 0 {
+            continue;
+        }
+        let stride = usize::try_from(entry.p).expect("prime must fit usize");
+        for next in entry_state.next_offsets[..entry.bad_class_count as usize].iter_mut() {
+            let mut i = *next;
+            while i < iterations {
+                rejected[i] = true;
+                i += stride;
+            }
+            *next = i - iterations;
+        }
+    }
+    rejected
+}
+
+// Helpers retained for mathematical regression tests.
+#[cfg(test)]
+fn crtcomp_pass_small_primes(n: &UBig) -> bool {
+    const SMALL: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+    for p in SMALL {
+        let bp = UBig::from(p);
+        if n == &bp {
+            return true;
+        }
+        if n % &bp == UBig::from(0u32) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn crtcomp_mr_only(n: &UBig) -> bool {
+    let zero = UBig::from(0u32);
+    let one = UBig::from(1u32);
+    let two = UBig::from(2u32);
+
+    if n < &two {
+        return false;
+    }
+
+    let n_minus_one = n - &one;
+    let mut d = n_minus_one.clone();
+    let mut s = 0u32;
+
+    while &d % &two == zero {
+        d /= &two;
+        s += 1;
+    }
+
+    const BASES: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+    for a in BASES {
+        let base = UBig::from(a);
+        if base >= n_minus_one {
+            continue;
+        }
+
+        let mut x = modpow_dashu(&base, &d, n);
+
+        if x == one || x == n_minus_one {
+            continue;
+        }
+
+        let mut passed = false;
+
+        for _ in 1..s {
+            x = modpow_dashu(&x, &two, n);
+            if x == n_minus_one {
+                passed = true;
+                break;
+            }
+        }
+
+        if !passed {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_probable_prime_ring_max(n: &UBig) -> bool {
+    use dashu_int::fast_div::ConstDivisor;
+
+    let zero = UBig::from(0u32);
+    let one = UBig::from(1u32);
+    let two = UBig::from(2u32);
+
+    if n < &two {
+        return false;
+    }
+
+    const BASES: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+    for p in BASES {
+        let small = UBig::from(p);
+        if n == &small {
+            return true;
+        }
+        if n % &small == zero {
+            return false;
+        }
+    }
+
+    // Every MAX candidate is 7 mod 12, hence 3 mod 4.
+    assert_eq!(n % UBig::from(4u32), UBig::from(3u32));
+
+    let minus_one = n - &one;
+    let d = &minus_one / &two;
+
+    // Prepare the modulus ONCE for all twelve bases.
+    let ring = ConstDivisor::new(n.clone());
+
+    for a in BASES {
+        let base = UBig::from(a);
+
+        if base >= minus_one {
+            continue;
+        }
+
+        let x = ring.reduce(base).pow(&d).residue();
+
+        if x != one && x != minus_one {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// General 12-base Miller--Rabin using one prepared dashu modulus.  Unlike
+/// `is_probable_prime_ring_max`, this routine makes no assumption about the
+/// residue class of its input and is therefore also valid for RANDOM_ODD.
+fn is_probable_prime_ring_general(n: &UBig) -> bool {
+    use dashu_int::fast_div::ConstDivisor;
+
+    const BASES: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    let zero = UBig::from(0u32);
+    let one = UBig::from(1u32);
+    let two = UBig::from(2u32);
+    if n < &two {
+        return false;
+    }
+    for p in BASES {
+        let small = UBig::from(p);
+        if n == &small {
+            return true;
+        }
+        if n % &small == zero {
+            return false;
+        }
+    }
+
+    let minus_one = n - &one;
+    let mut d = minus_one.clone();
+    let mut s = 0usize;
+    while &d % &two == zero {
+        d /= &two;
+        s += 1;
+    }
+    let ring = ConstDivisor::new(n.clone());
+    for base in BASES {
+        let a = UBig::from(base);
+        if a >= minus_one {
+            continue;
+        }
+        let mut x = ring.reduce(a).pow(&d).residue();
+        if x == one || x == minus_one {
+            continue;
+        }
+        let mut passed = false;
+        for _ in 1..s {
+            x = ring.reduce(x).sqr().residue();
+            if x == minus_one {
+                passed = true;
+                break;
+            }
+        }
+        if !passed {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn crtcomp_run_arm_core<F>(
+    iterations: usize,
+    start_n: &UBig,
+    step_n: &UBig,
+    rejected: Option<&[bool]>,
+    marking_s: f64,
+    mut observe_survivor: F,
+) -> CrtCompArmStats
+where
+    F: FnMut(usize, &UBig, &UBig, bool),
+{
+    let total_start = std::time::Instant::now();
+
+    let mut stats = CrtCompArmStats {
+        ..Default::default()
+    };
+
+    let mut n = start_n.clone();
+
+    for i in 0..iterations {
+        if rejected.map(|m| m[i]).unwrap_or(false) {
+            stats.rejected_before_build += 1;
+            n += step_n;
+            continue;
+        }
+
+        let build_start = std::time::Instant::now();
+        let candidate = n_candidate_from_n(&n);
+        stats.build_s += build_start.elapsed().as_secs_f64();
+        stats.built += 1;
+
+        if !crtcomp_pass_small_primes(&candidate) {
+            observe_survivor(i, &n, &candidate, false);
+            n += step_n;
+            continue;
+        }
+
+        stats.entered_mr += 1;
+
+        let mr_start = std::time::Instant::now();
+        let prime = crtcomp_mr_only(&candidate);
+        stats.mr_s += mr_start.elapsed().as_secs_f64();
+
+        if prime {
+            stats.hits += 1;
+        }
+
+        observe_survivor(i, &n, &candidate, prime);
+        n += step_n;
+    }
+
+    stats.total_s = total_start.elapsed().as_secs_f64() + marking_s;
+    stats
+}
+
+// Candidate cursor used by the optimized engine.
+struct CrtCompCandidateCursor {
+    index: usize,
+    candidate: UBig,
+    delta: UBig,
+    second_difference: UBig,
+}
+
+impl CrtCompCandidateCursor {
+    fn new(start_n: &UBig, step_n: &UBig) -> Self {
+        let twelve_step = step_n * UBig::from(12u32);
+        let six_step = step_n * UBig::from(6u32);
+        let delta = &twelve_step * start_n + &six_step * (step_n + UBig::from(1u32));
+        Self {
+            index: 0,
+            candidate: n_candidate_from_n(start_n),
+            delta,
+            second_difference: &twelve_step * step_n,
+        }
+    }
+
+    fn at(&mut self, index: usize) -> &UBig {
+        let gap = index
+            .checked_sub(self.index)
+            .expect("survivor indices must be nondecreasing within a window");
+        match gap {
+            0 => {}
+            1 => {
+                self.candidate += &self.delta;
+                self.delta += &self.second_difference;
+            }
+            _ => {
+                let k = UBig::from(u64::try_from(gap).expect("gap must fit u64"));
+                let triangle = (gap as u128) * ((gap - 1) as u128) / 2;
+                let triangle = UBig::from(triangle);
+                self.candidate += &self.delta * &k;
+                self.candidate += &self.second_difference * &triangle;
+                self.delta += &self.second_difference * &k;
+            }
+        }
+        self.index = index;
+        &self.candidate
+    }
+}
+
+// Helpers retained for regression tests.
+#[cfg(test)]
+const MAX_RANDOM_RESERVOIR: usize = 4_000;
+#[cfg(test)]
+const MAX_RANDOM_MAX_ROUND_STRIDE: u64 = 10_000_000;
+
+#[cfg(test)]
+fn random_odd_with_bits_from_rng<R: Rng + ?Sized>(bits: usize, rng: &mut R) -> UBig {
+    let bytes_len = bits.div_ceil(8);
+    let excess = bytes_len * 8 - bits;
+    let mut bytes = vec![0u8; bytes_len];
+    rng.fill(bytes.as_mut_slice());
+    bytes[0] &= 0xff >> excess;
+    bytes[0] |= 1u8 << (7 - excess);
+    *bytes.last_mut().expect("positive bit length") |= 1;
+    UBig::from_be_bytes(&bytes)
+}
+
+#[cfg(test)]
+fn random_odd_with_bits(bits: usize) -> UBig {
+    random_odd_with_bits_from_rng(bits, &mut rand::thread_rng())
+}
+
+#[derive(Clone, Debug)]
+#[cfg(test)]
+struct RandomPresieveBatch {
+    product: u64,
+}
+
+#[cfg(test)]
+fn compile_random_presieve(odd_primes: &[u32]) -> Vec<RandomPresieveBatch> {
+    let mut batches = Vec::new();
+    let mut product = 1u64;
+    for &prime in odd_primes {
+        let prime = u64::from(prime);
+        if let Some(next) = product.checked_mul(prime) {
+            product = next;
+        } else {
+            batches.push(RandomPresieveBatch { product });
+            product = prime;
+        }
+    }
+    if product > 1 {
+        batches.push(RandomPresieveBatch { product });
+    }
+    batches
+}
+
+#[cfg(test)]
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+#[cfg(test)]
+fn random_odd_rejected_by_presieve(candidate: &UBig, batches: &[RandomPresieveBatch]) -> bool {
+    // One BigInt-by-word remainder covers every prime packed into the batch.
+    // The following gcd is word-sized, eliminating one BigInt division per
+    // small prime while preserving exactly the same survivor set.
+    batches.iter().any(|batch| {
+        let remainder = candidate % batch.product;
+        gcd_u64(remainder, batch.product) != 1
+    })
+}
+
 fn print_usage() {
     println!();
     println!("Usage:");
@@ -4098,6 +5255,7 @@ fn print_usage() {
     println!("  max_prime_public_client status");
     println!("  max_prime_public_client discoveries");
     println!("  max_prime_public_client discoveries-all");
+
     println!("  max_prime_public_client local-demo [iterations] [n_digits]");
     println!("  max_prime_public_client advanced-local-preview <experiment.json>");
     println!("  max_prime_public_client advanced-local <experiment.json>");
@@ -4114,6 +5272,267 @@ fn parse_usize_arg(args: &[String], pos: usize, default_value: usize) -> usize {
     args.get(pos)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(default_value)
+}
+
+#[cfg(test)]
+fn primes_up_to(limit: u32) -> Vec<u32> {
+    if limit < 2 {
+        return Vec::new();
+    }
+
+    let mut is_prime = vec![true; (limit as usize) + 1];
+    is_prime[0] = false;
+    is_prime[1] = false;
+
+    let mut p = 2usize;
+
+    while p * p <= limit as usize {
+        if is_prime[p] {
+            let mut multiple = p * p;
+
+            while multiple <= limit as usize {
+                is_prime[multiple] = false;
+                multiple += p;
+            }
+        }
+
+        p += 1;
+    }
+
+    is_prime
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &prime)| if prime { Some(i as u32) } else { None })
+        .collect()
+}
+
+#[cfg(test)]
+fn decimal_mod_u32(text: &str, modulus: u32) -> Result<u32, String> {
+    if modulus == 0 {
+        return Err("decimal_mod_u32 modulus cannot be zero.".to_string());
+    }
+
+    let mut r = 0u64;
+    let m = modulus as u64;
+
+    for b in text.bytes() {
+        if !b.is_ascii_digit() {
+            return Err(format!("Invalid decimal integer: {}", text));
+        }
+
+        r = (r * 10 + (b - b'0') as u64) % m;
+    }
+
+    Ok(r as u32)
+}
+
+#[cfg(test)]
+fn small_mod_pow(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
+    if modulus == 1 {
+        return 0;
+    }
+
+    let mut result = 1u64;
+    base %= modulus;
+
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = (result * base) % modulus;
+        }
+
+        base = (base * base) % modulus;
+        exp >>= 1;
+    }
+
+    result
+}
+
+#[cfg(test)]
+fn small_mod_inverse_prime(value: u64, prime: u64) -> Option<u64> {
+    let value = value % prime;
+
+    if value == 0 {
+        return None;
+    }
+
+    Some(small_mod_pow(value, prime - 2, prime))
+}
+
+#[cfg(test)]
+fn tonelli_shanks_u64(n: u64, p: u64) -> Option<u64> {
+    if p == 2 {
+        return Some(n % 2);
+    }
+
+    let n = n % p;
+
+    if n == 0 {
+        return Some(0);
+    }
+
+    if small_mod_pow(n, (p - 1) / 2, p) != 1 {
+        return None;
+    }
+
+    if p % 4 == 3 {
+        return Some(small_mod_pow(n, (p + 1) / 4, p));
+    }
+
+    let mut q = p - 1;
+    let mut s = 0u32;
+
+    while q % 2 == 0 {
+        q /= 2;
+        s += 1;
+    }
+
+    let mut z = 2u64;
+
+    while small_mod_pow(z, (p - 1) / 2, p) != p - 1 {
+        z += 1;
+    }
+
+    let mut c = small_mod_pow(z, q, p);
+    let mut x = small_mod_pow(n, (q + 1) / 2, p);
+    let mut t = small_mod_pow(n, q, p);
+    let mut m = s;
+
+    while t != 1 {
+        let mut i = 1u32;
+        let mut t2i = (t * t) % p;
+
+        while t2i != 1 {
+            t2i = (t2i * t2i) % p;
+            i += 1;
+
+            if i >= m {
+                return None;
+            }
+        }
+
+        let exponent = 1u64 << (m - i - 1);
+        let b = small_mod_pow(c, exponent, p);
+
+        x = (x * b) % p;
+        let b2 = (b * b) % p;
+        t = (t * b2) % p;
+        c = b2;
+        m = i;
+    }
+
+    Some(x)
+}
+
+#[cfg(test)]
+fn max_bad_n_residues(prime: u32) -> Vec<u32> {
+    let p = prime as u64;
+
+    /*
+     * N(n) = 6*n^2 + 6*n + 31.
+     *
+     * Multiply by 6:
+     *
+     *   6*N(n) = (6*n + 3)^2 + 177
+     *
+     * Therefore, for p != 2,3:
+     *
+     *   N(n) == 0 (mod p)
+     *
+     * iff
+     *
+     *   (6*n + 3)^2 == -177 (mod p).
+     *
+     * We solve one modular square-root problem and obtain at most
+     * two forbidden residue classes for n modulo p.
+     */
+
+    if prime == 2 || prime == 3 {
+        let mut roots = Vec::new();
+
+        for n in 0..prime {
+            let n64 = n as u64;
+            let value = (6 * n64 * n64 + 6 * n64 + 31) % p;
+
+            if value == 0 {
+                roots.push(n);
+            }
+        }
+
+        return roots;
+    }
+
+    let rhs = (p - (177 % p)) % p;
+
+    let Some(root_y) = tonelli_shanks_u64(rhs, p) else {
+        return Vec::new();
+    };
+
+    let inv6 =
+        small_mod_inverse_prime(6, p).expect("6 must be invertible for primes other than 2 and 3");
+
+    let mut roots = Vec::with_capacity(2);
+
+    let y1 = root_y;
+    let y2 = if root_y == 0 { 0 } else { p - root_y };
+
+    for y in [y1, y2] {
+        let shifted = (y + p - (3 % p)) % p;
+        let n_root = (shifted * inv6) % p;
+
+        if !roots.contains(&(n_root as u32)) {
+            roots.push(n_root as u32);
+        }
+    }
+
+    roots
+}
+
+#[cfg(test)]
+fn mark_structural_residue_classes(
+    iterations: usize,
+    n0_txt: &str,
+    step_txt: &str,
+    primes: &[u32],
+) -> Result<Vec<bool>, String> {
+    let mut composite = vec![false; iterations];
+
+    for p in primes {
+        let p64 = *p as u64;
+
+        let bad_n_residues = max_bad_n_residues(*p);
+
+        if bad_n_residues.is_empty() {
+            continue;
+        }
+
+        let n0_mod = decimal_mod_u32(n0_txt, *p)? as u64;
+        let step_mod = decimal_mod_u32(step_txt, *p)? as u64;
+
+        if step_mod == 0 {
+            if bad_n_residues.iter().any(|r| *r as u64 == n0_mod) {
+                composite.fill(true);
+            }
+
+            continue;
+        }
+
+        let inv_step = small_mod_inverse_prime(step_mod, p64)
+            .ok_or_else(|| format!("Cannot invert step modulo prime {}", p))?;
+
+        for bad_n in bad_n_residues {
+            let delta = (bad_n as u64 + p64 - n0_mod) % p64;
+            let first_i = (delta * inv_step) % p64;
+
+            let mut i = first_i as usize;
+
+            while i < iterations {
+                composite[i] = true;
+                i += *p as usize;
+            }
+        }
+    }
+
+    Ok(composite)
 }
 
 fn main() {
@@ -4208,6 +5627,7 @@ fn main() {
             print_next();
             Ok(())
         }
+
         "local-demo" => {
             let iterations = parse_usize_arg(&args, 2, 1500);
             let n_digits = parse_usize_arg(&args, 3, 20);
@@ -4238,6 +5658,7 @@ fn main() {
             let idx = parse_usize_arg(&args, 2, 0);
             copy_local_sha(idx)
         }
+
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -4255,6 +5676,85 @@ fn main() {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn general_prepared_miller_rabin_matches_reference() {
+        let cases = [
+            0u64, 1, 2, 3, 4, 5, 9, 17, 25, 37, 41, 97, 341, 561, 1_105, 65_537,
+        ];
+        for value in cases {
+            let n = UBig::from(value);
+            assert_eq!(
+                is_probable_prime_ring_general(&n),
+                is_probable_prime(&n),
+                "n={value}"
+            );
+        }
+        for _ in 0..32 {
+            let n = random_odd_with_bits(257);
+            assert_eq!(is_probable_prime_ring_general(&n), is_probable_prime(&n));
+        }
+    }
+
+    #[test]
+    fn seeded_random_odd_generation_is_reproducible_and_exact_width() {
+        let mut first = rand::rngs::StdRng::seed_from_u64(42);
+        let mut second = rand::rngs::StdRng::seed_from_u64(42);
+        for bits in [64usize, 257, 3_318] {
+            let a = random_odd_with_bits_from_rng(bits, &mut first);
+            let b = random_odd_with_bits_from_rng(bits, &mut second);
+            assert_eq!(a, b);
+            assert_eq!(a.bit_len(), bits);
+            assert_eq!(&a % UBig::from(2u32), UBig::from(1u32));
+        }
+    }
+
+    #[test]
+    fn optimized_random_presieve_matches_ubig_division() {
+        let primes: Vec<u32> = primes_up_to(10_000)
+            .into_iter()
+            .filter(|&p| p != 2)
+            .collect();
+        let batches = compile_random_presieve(&primes);
+        assert!(batches.len() < primes.len() / 2);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..32 {
+            let candidate = random_odd_with_bits_from_rng(521, &mut rng);
+            let legacy = primes
+                .iter()
+                .any(|&p| &candidate % UBig::from(p) == UBig::from(0u32));
+            assert_eq!(
+                random_odd_rejected_by_presieve(&candidate, &batches),
+                legacy
+            );
+        }
+    }
+
+    #[test]
+    fn max_b_round_progressions_are_disjoint() {
+        let starts: Vec<u64> = (0..3)
+            .map(|round| round * MAX_RANDOM_MAX_ROUND_STRIDE)
+            .collect();
+        assert_eq!(starts, [0, 10_000_000, 20_000_000]);
+        assert!(starts
+            .windows(2)
+            .all(|pair| pair[0] + (MAX_RANDOM_RESERVOIR as u64) < pair[1]));
+    }
+
+    #[test]
+    fn general_prepared_miller_rabin_matches_pr12_max_engine() {
+        let start =
+            parse_ubig_decimal("MAX equivalence start", &format!("1{}", "0".repeat(149))).unwrap();
+        let mut cursor = CrtCompCandidateCursor::new(&start, &UBig::from(1u32));
+        for i in 0..64 {
+            let candidate = cursor.at(i);
+            assert_eq!(
+                is_probable_prime_ring_general(candidate),
+                is_probable_prime_ring_max(candidate),
+                "MAX index={i}"
+            );
+        }
+    }
 
     #[test]
     fn accepts_canonical_official_api_base() {
@@ -4398,5 +5898,1061 @@ mod security_tests {
             0o600
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+// This module deliberately lives next to the current engine instead of being a
+// second implementation used by production.  The functions above are the
+// frozen oracle that future engine changes must continue to match.
+#[cfg(test)]
+mod engine_equivalence_tests {
+    use super::*;
+
+    #[test]
+    fn max_euler_jacobi_and_prepared_ring_agree() {
+        // For prime MAX candidates:
+        // 3^((N-1)/2) mod N == N-1.
+        // The corresponding base-2 sign is determined by N mod 8.
+        let one = UBig::from(1u32);
+        let two = UBig::from(2u32);
+        let three = UBig::from(3u32);
+        let eight = UBig::from(8u32);
+
+        let mut checked = 0usize;
+
+        for n in 0..400u64 {
+            let candidate = n_candidate_from_n(&UBig::from(n));
+
+            assert_eq!(
+                is_probable_prime(&candidate),
+                is_probable_prime_ring_max(&candidate)
+            );
+
+            if !is_probable_prime(&candidate) {
+                continue;
+            }
+
+            checked += 1;
+
+            let exp = (&candidate - &one) / &two;
+
+            assert_eq!(modpow_dashu(&three, &exp, &candidate), &candidate - &one);
+
+            let expected_two = if &candidate % &eight == UBig::from(7u32) {
+                one.clone()
+            } else {
+                &candidate - &one
+            };
+
+            assert_eq!(modpow_dashu(&two, &exp, &candidate), expected_two);
+        }
+
+        assert!(checked >= 5);
+    }
+
+    #[test]
+    fn fixed_time_ring_equivalence_test() {
+        fn check_progression(name: &str, start: &UBig, step: &UBig, count: usize) {
+            let mut original_hits = Vec::new();
+            let mut optimized_hits = Vec::new();
+
+            let mut cursor = CrtCompCandidateCursor::new(start, step);
+
+            for i in 0..count {
+                let candidate = cursor.at(i).clone();
+
+                assert_eq!(
+                    &candidate % UBig::from(12u32),
+                    UBig::from(7u32),
+                    "{name}: unexpected MAX residue"
+                );
+
+                let original = is_probable_prime(&candidate);
+
+                let optimized = is_probable_prime_ring_max(&candidate);
+
+                assert_eq!(original, optimized, "{name}: ring mismatch at {i}");
+
+                if crtcomp_pass_small_primes(&candidate) {
+                    assert_eq!(
+                        original,
+                        crtcomp_mr_only(&candidate),
+                        "{name}: MR-only mismatch at {i}"
+                    );
+                }
+
+                if original {
+                    let digest = Sha256::digest(candidate.to_string().as_bytes());
+                    original_hits.push((i, format!("{digest:x}")));
+                }
+
+                if optimized {
+                    let digest = Sha256::digest(candidate.to_string().as_bytes());
+                    optimized_hits.push((i, format!("{digest:x}")));
+                }
+            }
+
+            assert_eq!(
+                original_hits, optimized_hits,
+                "{name}: hit index/hash mismatch"
+            );
+        }
+
+        let b_start = parse_ubig_decimal("B test start", &format!("1{}", "0".repeat(149))).unwrap();
+
+        check_progression("B_300_DIGITS", &b_start, &UBig::from(1u32), 80);
+
+        let b_large =
+            parse_ubig_decimal("B large test start", &format!("1{}", "0".repeat(499))).unwrap();
+
+        check_progression("B_1000_DIGITS", &b_large, &UBig::from(1u32), 24);
+
+        let (m, r) = crtcomp_build_safecrt50();
+
+        let d_raw =
+            parse_ubig_decimal("D raw test start", &format!("1{}", "0".repeat(249))).unwrap();
+
+        let d_start = &r + &m * d_raw;
+
+        check_progression("D_SAFECRT50", &d_start, &m, 48);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CandidateTrace {
+        survivor_indices: Vec<usize>,
+        n_values: Vec<UBig>,
+        candidates: Vec<UBig>,
+        mr_results: Vec<bool>,
+        hit_indices: Vec<usize>,
+    }
+
+    fn candidate_is_divisible_directly(n: &UBig, p: u64) -> bool {
+        n_candidate_from_n(n) % UBig::from(p) == UBig::from(0u32)
+    }
+
+    #[test]
+    fn direct_ubig_mod_matches_legacy_decimal_reduction() {
+        let values = [
+            UBig::from(0u32),
+            UBig::from(1u32),
+            UBig::from(u64::MAX),
+            parse_ubig_decimal("large", "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999").unwrap(),
+        ];
+        let moduli = [2u64, 3, 31, 59, 751, 65_537, 4_294_967_291, u64::MAX - 58];
+        for value in &values {
+            for &p in &moduli {
+                assert_eq!(
+                    crtcomp_ubig_mod_u64(value, p),
+                    crtcomp_ubig_mod_u64_legacy(value, p)
+                );
+            }
+        }
+        for &p in &moduli {
+            for value in [
+                UBig::from(p - 1),
+                UBig::from(p),
+                UBig::from(p) + UBig::from(1u32),
+            ] {
+                assert_eq!(
+                    crtcomp_ubig_mod_u64(&value, p),
+                    crtcomp_ubig_mod_u64_legacy(&value, p)
+                );
+            }
+        }
+    }
+
+    fn direct_mask(
+        iterations: usize,
+        start: &UBig,
+        step: &UBig,
+        primes: &[u64],
+        complementary_safecrt50: bool,
+    ) -> Vec<bool> {
+        (0..iterations)
+            .map(|i| {
+                let n = start + step * UBig::from(i as u64);
+                primes.iter().any(|&p| {
+                    (!complementary_safecrt50 || !CRTCOMP_SAFECRT50.contains(&p))
+                        && candidate_is_divisible_directly(&n, p)
+                })
+            })
+            .collect()
+    }
+
+    fn oracle_trace(start: &UBig, step: &UBig, mask: &[bool]) -> CandidateTrace {
+        let survivor_indices: Vec<_> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rejected)| (!rejected).then_some(i))
+            .collect();
+        let n_values: Vec<_> = survivor_indices
+            .iter()
+            .map(|&i| start + step * UBig::from(i as u64))
+            .collect();
+        let candidates: Vec<_> = n_values.iter().map(n_candidate_from_n).collect();
+        let mr_results: Vec<_> = candidates.iter().map(is_probable_prime).collect();
+        let hit_indices = survivor_indices
+            .iter()
+            .zip(&mr_results)
+            .filter_map(|(&i, &hit)| hit.then_some(i))
+            .collect();
+
+        CandidateTrace {
+            survivor_indices,
+            n_values,
+            candidates,
+            mr_results,
+            hit_indices,
+        }
+    }
+
+    fn engine_trace(start: &UBig, step: &UBig, mask: &[bool]) -> CandidateTrace {
+        let mut survivor_indices = Vec::new();
+        let mut n_values = Vec::new();
+        let mut candidates = Vec::new();
+        let mut mr_results = Vec::new();
+        let mut hit_indices = Vec::new();
+
+        let stats = crtcomp_run_arm_core(
+            mask.len(),
+            start,
+            step,
+            Some(mask),
+            0.0,
+            |i, n, candidate, probable_prime| {
+                survivor_indices.push(i);
+                n_values.push(n.clone());
+                candidates.push(candidate.clone());
+                mr_results.push(probable_prime);
+                if probable_prime {
+                    hit_indices.push(i);
+                }
+            },
+        );
+
+        assert_eq!(stats.built, survivor_indices.len());
+        assert_eq!(stats.rejected_before_build + stats.built, mask.len());
+        assert_eq!(stats.hits, hit_indices.len());
+
+        CandidateTrace {
+            survivor_indices,
+            n_values,
+            candidates,
+            mr_results,
+            hit_indices,
+        }
+    }
+
+    fn segmented_mask(
+        total: usize,
+        segment_size: usize,
+        start: &UBig,
+        step: &UBig,
+        primes: &[u64],
+        complementary_safecrt50: bool,
+    ) -> Vec<bool> {
+        let mut result = Vec::with_capacity(total);
+        let mut offset = 0usize;
+        while offset < total {
+            let len = segment_size.min(total - offset);
+            let segment_start = start + step * UBig::from(offset as u64);
+            result.extend(crtcomp_mark_structural(
+                len,
+                &segment_start,
+                step,
+                primes,
+                complementary_safecrt50,
+            ));
+            offset += len;
+        }
+        result
+    }
+
+    fn assert_persistent_sequence(
+        lengths: &[usize],
+        start: &UBig,
+        step: &UBig,
+        primes: &[u64],
+        complementary_safecrt50: bool,
+    ) {
+        let total: usize = lengths.iter().sum();
+        let schedule = crtcomp_compile_schedule(primes, step, complementary_safecrt50);
+        let one_shot = crtcomp_mark_compiled(total, start, &schedule);
+        let mut legacy_segments = Vec::with_capacity(total);
+        let mut persistent_segments = Vec::with_capacity(total);
+        let mut state = crtcomp_initialize_persistent_state(start, &schedule);
+        let mut offset = 0usize;
+
+        for &len in lengths {
+            let segment_start = start + step * UBig::from(offset as u64);
+            legacy_segments.extend(crtcomp_mark_compiled(len, &segment_start, &schedule));
+            persistent_segments.extend(crtcomp_mark_persistent(len, &schedule, &mut state));
+            offset += len;
+        }
+        assert_eq!(one_shot, legacy_segments, "legacy concatenation mismatch");
+        assert_eq!(
+            one_shot, persistent_segments,
+            "persistent concatenation mismatch"
+        );
+    }
+
+    #[test]
+    fn max_formula_and_square_identity_hold() {
+        let fixed = [0u64, 1, 2, 7, 31, 999, 65_537, 1_000_003];
+        for n64 in fixed {
+            let n = UBig::from(n64);
+            let candidate = n_candidate_from_n(&n);
+            let expanded = UBig::from(6u32) * &n * &n + UBig::from(6u32) * &n + UBig::from(31u32);
+            let square_term = UBig::from(6u32) * &n + UBig::from(3u32);
+            assert_eq!(candidate, expanded, "expanded formula failed for n={n64}");
+            assert_eq!(
+                UBig::from(6u32) * &candidate,
+                &square_term * &square_term + UBig::from(177u32),
+                "square identity failed for n={n64}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_residue_classes_match_brute_force() {
+        for p in crtcomp_primes_up_to(2_000) {
+            let mut calculated = crtcomp_bad_n_classes(p);
+            calculated.sort_unstable();
+            let brute_force: Vec<_> = (0..p)
+                .filter(|&n| candidate_is_divisible_directly(&UBig::from(n), p))
+                .collect();
+            assert_eq!(calculated, brute_force, "forbidden classes modulo {p}");
+            for n in calculated {
+                assert!(
+                    candidate_is_divisible_directly(&UBig::from(n), p),
+                    "class {n} modulo {p}"
+                );
+                for k in [0u64, 1, 7, 101] {
+                    assert!(candidate_is_divisible_directly(&UBig::from(n + k * p), p));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structural_masks_match_direct_oracle_for_starts_steps_and_limits() {
+        let configurations = [
+            ("0", "1", 37usize),
+            ("17", "7", 127),
+            ("123456789012345678901234567890", "19", 509),
+            ("987654321098765432109876543210", "210", 1_009),
+        ];
+        for (start_text, step_text, limit) in configurations {
+            let start = parse_ubig_decimal("test start", start_text).unwrap();
+            let step = parse_ubig_decimal("test step", step_text).unwrap();
+            let primes = crtcomp_primes_up_to(limit);
+            let actual = crtcomp_mark_structural(1_337, &start, &step, &primes, false);
+            assert_eq!(actual, direct_mask(1_337, &start, &step, &primes, false));
+
+            let primes32: Vec<_> = primes.iter().map(|&p| p as u32).collect();
+            assert_eq!(
+                actual,
+                mark_structural_residue_classes(1_337, start_text, step_text, &primes32).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn structural_mask_is_independent_of_segmentation() {
+        let start = parse_ubig_decimal("test start", "123456789012345678901").unwrap();
+        let step = UBig::from(37u32);
+        let primes = crtcomp_primes_up_to(1_009);
+        let whole = crtcomp_mark_structural(4_096, &start, &step, &primes, false);
+        let whole_trace = engine_trace(&start, &step, &whole[..256]);
+        for segment_size in [17usize, 64, 127, 1_000] {
+            let segmented = segmented_mask(4_096, segment_size, &start, &step, &primes, false);
+            assert_eq!(
+                whole, segmented,
+                "byte-for-byte mask mismatch for segment size {segment_size}"
+            );
+            assert_eq!(whole_trace, engine_trace(&start, &step, &segmented[..256]));
+        }
+    }
+
+    #[test]
+    fn incremental_candidate_cursor_matches_original_for_skips_windows_b_and_d() {
+        let big_start =
+            parse_ubig_decimal("incremental B start", &format!("1{}", "0".repeat(499))).unwrap();
+        let (m, r) = crtcomp_build_safecrt50();
+        let d_start = &r + &m * &big_start;
+        let cases = [
+            ("B-small", UBig::from(17u32), UBig::from(1u32), false),
+            ("B-big", big_start.clone(), UBig::from(37u32), false),
+            ("D", d_start, &m * UBig::from(11u32), true),
+            ("zero-step", UBig::from(0u32), UBig::from(0u32), false),
+        ];
+        let primes = crtcomp_primes_up_to(509);
+        for (name, start, step, complementary) in cases {
+            for window_len in [1usize, 17, 64, 127, 257] {
+                let mut window_start = start.clone();
+                for window in 0..3usize {
+                    let actual_mask = crtcomp_mark_structural(
+                        window_len,
+                        &window_start,
+                        &step,
+                        &primes,
+                        complementary,
+                    );
+                    let masks = [
+                        actual_mask,
+                        (0..window_len).map(|i| i % 5 == 0 || i % 7 == 0).collect(),
+                        vec![false; window_len],
+                        vec![true; window_len],
+                    ];
+                    for mask in masks {
+                        let mut cursor = CrtCompCandidateCursor::new(&window_start, &step);
+                        for (i, rejected) in mask.iter().enumerate() {
+                            if *rejected {
+                                continue;
+                            }
+                            let n = &window_start + &step * UBig::from(i as u64);
+                            let oracle = n_candidate_from_n(&n);
+                            assert_eq!(
+                                cursor.at(i),
+                                &oracle,
+                                "{name} window={window} len={window_len} i={i}"
+                            );
+                            // Same primality result, including 0 and repeated n.
+                            if name == "B-small" && i < 8 {
+                                assert_eq!(
+                                    is_probable_prime(cursor.at(i)),
+                                    is_probable_prime(&oracle)
+                                );
+                            }
+                        }
+                    }
+                    window_start += &step * UBig::from(window_len as u64);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_offsets_match_compiled_recompute_for_variable_segments_b_and_d() {
+        let sequences: &[&[usize]] = &[
+            &[17, 64, 127, 1_000],
+            &[1, 1, 1, 1, 1],
+            &[1_000, 17, 4_096, 3, 511],
+        ];
+        let primes = crtcomp_primes_up_to(2_003);
+        let b_start = parse_ubig_decimal("B start", "123456789012345678901234567890").unwrap();
+        let b_step = UBig::from(37u32);
+        let (m, r) = crtcomp_build_safecrt50();
+        let d_start = &r + &m * UBig::from(43u32);
+        let d_step = &m * UBig::from(11u32);
+
+        for lengths in sequences {
+            assert_persistent_sequence(lengths, &b_start, &b_step, &primes, false);
+            assert_persistent_sequence(lengths, &d_start, &d_step, &primes, true);
+        }
+    }
+
+    #[test]
+    fn persistent_offsets_cover_empty_degenerate_and_named_prime_cases() {
+        let start = UBig::from(59u32);
+        let step_zero = UBig::from(0u32);
+        assert_persistent_sequence(&[1, 17, 3], &start, &step_zero, &[], false);
+        // Includes p=2, p=3, p=59, entries with zero/one/two forbidden
+        // classes, and a segment both shorter and longer than each small p.
+        assert_persistent_sequence(
+            &[1, 64, 7, 127],
+            &start,
+            &step_zero,
+            &[2, 3, 5, 7, 31, 59],
+            false,
+        );
+
+        let step = UBig::from(59u32);
+        assert_persistent_sequence(
+            &[17, 1, 127, 3],
+            &UBig::from(7u32),
+            &step,
+            &[2, 3, 5, 59],
+            false,
+        );
+    }
+
+    #[test]
+    fn safecrt50_progression_and_complementary_sieve_match_oracles() {
+        let (m, r) = crtcomp_build_safecrt50();
+        crtcomp_validate_safecrt50(&m, &r).unwrap();
+        for p in CRTCOMP_SAFECRT50 {
+            assert_eq!(crtcomp_ubig_mod_u64(&m, p), 0, "M modulo {p}");
+        }
+
+        let primes = crtcomp_primes_up_to(2_003);
+        for raw_start in [0u64, 1, 29, 10_007] {
+            for raw_step in [1u64, 7, 64] {
+                let effective_start = &r + &m * UBig::from(raw_start);
+                let effective_step = &m * UBig::from(raw_step);
+                for i in 0..257u64 {
+                    let n = &effective_start + &effective_step * UBig::from(i);
+                    for p in CRTCOMP_SAFECRT50 {
+                        assert_ne!(
+                            n_candidate_from_n(&n) % UBig::from(p),
+                            UBig::from(0u32),
+                            "SAFECRT50 candidate {i} divisible modulo {p}"
+                        );
+                    }
+                }
+
+                let actual =
+                    crtcomp_mark_structural(513, &effective_start, &effective_step, &primes, true);
+                assert_eq!(
+                    actual,
+                    direct_mask(513, &effective_start, &effective_step, &primes, true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complementary_mask_is_independent_of_segmentation() {
+        let (m, r) = crtcomp_build_safecrt50();
+        let start = &r + &m * UBig::from(43u32);
+        let step = &m * UBig::from(11u32);
+        let primes = crtcomp_primes_up_to(2_003);
+        let whole = crtcomp_mark_structural(4_096, &start, &step, &primes, true);
+        // A short prefix is enough to compare every expensive BigInt/MR field;
+        // the complete 4096-entry mask is still compared byte-for-byte above.
+        let whole_trace = engine_trace(&start, &step, &whole[..64]);
+        for segment_size in [17usize, 64, 127, 1_000] {
+            let segmented = segmented_mask(4_096, segment_size, &start, &step, &primes, true);
+            assert_eq!(
+                whole, segmented,
+                "complementary mask mismatch for segment size {segment_size}"
+            );
+            assert_eq!(whole_trace, engine_trace(&start, &step, &segmented[..64]));
+        }
+    }
+
+    #[test]
+    fn b_and_d_pipeline_traces_match_current_engine_oracle() {
+        let b_start = UBig::from(10_000u32);
+        let b_step = UBig::from(13u32);
+        let b_primes = crtcomp_primes_up_to(509);
+        let b_mask = crtcomp_mark_structural(750, &b_start, &b_step, &b_primes, false);
+        assert_eq!(
+            engine_trace(&b_start, &b_step, &b_mask),
+            oracle_trace(&b_start, &b_step, &b_mask)
+        );
+
+        let (m, r) = crtcomp_build_safecrt50();
+        let d_start = &r + &m * UBig::from(3u32);
+        let d_step = &m * UBig::from(5u32);
+        let d_primes = crtcomp_primes_up_to(1_009);
+        let d_mask = crtcomp_mark_structural(300, &d_start, &d_step, &d_primes, true);
+        assert_eq!(
+            engine_trace(&d_start, &d_step, &d_mask),
+            oracle_trace(&d_start, &d_step, &d_mask)
+        );
+    }
+}
+
+// Test privati di equivalenza. Nessuna connessione al server.
+#[cfg(test)]
+mod private_engine_scale_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn cfg() -> OfficialClientConfig {
+        serde_json::from_value(serde_json::json!({
+            "mode": "offline",
+            "official_api_base": "https://www.max-russo.com/max/prime",
+            "client_device_id": "OFFLINE",
+            "participant_id": "OFFLINE",
+            "participant_token": "TEST-ONLY",
+            "participant_token_status": "registered",
+            "token_id": "",
+            "max_id": "",
+            "max_id_hash": "",
+            "public_nickname": "",
+            "public_display_name": "",
+            "max_login_status": "",
+            "registration_id": "",
+            "registration_status": "",
+            "login_session_id": "",
+            "login_session_status": "",
+            "login_started_at_unix": 0,
+            "login_expires_at_unix": 0,
+            "qr_text": "",
+            "deeplink": "",
+            "callback_url": "",
+            "created_at_unix": 0,
+            "updated_at_unix": 0,
+            "note": "offline test"
+        }))
+        .unwrap()
+    }
+
+    fn fixture(
+        name: &str,
+        n_digits: usize,
+        iterations: usize,
+        test_n: bool,
+        test_d: bool,
+        crt: bool,
+        m: u32,
+        r: u32,
+    ) -> serde_json::Value {
+        let n0 = format!("2{}", "0".repeat(n_digits - 1));
+
+        serde_json::json!({
+            "assignment": {
+                "assignment_id": format!("TEST-{name}"),
+                "assignment_token": "TEST-ONLY"
+            },
+            "work_unit": {
+                "challenge_id": "OFFLINE",
+                "campaign_id": "OFFLINE",
+                "work_unit_id": name,
+                "work_unit_index": 1,
+                "n0": n0,
+                "step": "17",
+                "start_i": 11,
+                "iterations": iterations,
+                "test_n": test_n,
+                "test_d": test_d,
+                "filter": {
+                    "enabled": crt,
+                    "modulus_m": m.to_string(),
+                    "remainder_r": r.to_string(),
+                    "original_moduli": [],
+                    "original_remainders": []
+                }
+            }
+        })
+    }
+
+    fn normalize(mut v: serde_json::Value) -> serde_json::Value {
+        v["elapsed_s"] = serde_json::json!(0.0);
+        v["result"]["elapsed_s"] = serde_json::json!(0.0);
+        v["result_json"]["elapsed_s"] = serde_json::json!(0.0);
+        v
+    }
+
+    fn compare(
+        name: &str,
+        n_digits: usize,
+        iterations: usize,
+        test_n: bool,
+        test_d: bool,
+        crt: bool,
+        m: u32,
+        r: u32,
+    ) {
+        let work = fixture(name, n_digits, iterations, test_n, test_d, crt, m, r);
+        let config = cfg();
+
+        let t0 = Instant::now();
+        let old = official_compute_work_unit_payload_legacy(&work, &config).unwrap();
+        let old_s = t0.elapsed().as_secs_f64();
+
+        let t1 = Instant::now();
+        let new = official_compute_work_unit_payload_optimized(&work, &config).unwrap();
+        let new_s = t1.elapsed().as_secs_f64();
+
+        assert_eq!(
+            normalize(old.clone()),
+            normalize(new.clone()),
+            "Payload mismatch in {name}"
+        );
+
+        println!(
+            "CASE={} EQUIVALENCE=OK \
+             N_DIGITS={} ITERATIONS={} \
+             HITS={} LEGACY_S={:.6} \
+             OPT_S={:.6} SPEEDUP={:.4}x",
+            name,
+            n_digits,
+            iterations,
+            old["hits"].as_array().unwrap().len(),
+            old_s,
+            new_s,
+            old_s / new_s,
+        );
+    }
+
+    #[test]
+    #[ignore = "Offline official small-package regression"]
+    fn official_small_package_sieve_regression() {
+        let config = cfg();
+
+        let mut cases = vec![
+            (
+                "2000_CRT",
+                fixture("OFFICIAL-2000-CRT", 1000, 25, true, false, true, 101, 3),
+            ),
+            (
+                "2000_NO_CRT",
+                fixture("OFFICIAL-2000-NO-CRT", 1000, 25, true, false, false, 1, 0),
+            ),
+            (
+                "5000_CRT",
+                fixture("OFFICIAL-5000-CRT", 2500, 25, true, false, true, 101, 3),
+            ),
+        ];
+
+        let mut positive = fixture("OFFICIAL-120-POSITIVE", 60, 25, true, false, false, 1, 0);
+
+        positive["work_unit"]["n0"] = serde_json::json!(format!("2{}", "0".repeat(59)));
+
+        positive["work_unit"]["step"] = serde_json::json!("17");
+
+        positive["work_unit"]["start_i"] = serde_json::json!(0);
+
+        positive["work_unit"]["iterations"] = serde_json::json!(25);
+
+        positive["work_unit"]["filter"]["enabled"] = serde_json::json!(false);
+
+        positive["work_unit"]["filter"]["modulus_m"] = serde_json::json!("1");
+
+        positive["work_unit"]["filter"]["remainder_r"] = serde_json::json!("0");
+
+        cases.push(("120_POSITIVE", positive));
+
+        for (name, work) in cases {
+            let start = std::time::Instant::now();
+
+            let legacy = official_compute_work_unit_payload_legacy(&work, &config).unwrap();
+
+            let legacy_s = start.elapsed().as_secs_f64();
+
+            let start = std::time::Instant::now();
+
+            let optimized = official_compute_work_unit_payload_optimized(&work, &config).unwrap();
+
+            let optimized_s = start.elapsed().as_secs_f64();
+
+            // La funzione normalize già esistente
+            // elimina soltanto i tempi di esecuzione.
+            assert_eq!(
+                normalize(legacy.clone()),
+                normalize(optimized.clone()),
+                "Official JSON differs: {name}"
+            );
+
+            if name == "120_POSITIVE" {
+                let expected_sha =
+                    "c03def80bc187f910a449aacbb6d81cccfbb5e6e576efba9681d6b0976c222e9";
+
+                let hits = optimized["hits"].as_array().unwrap();
+
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit["candidate_type"] == "N"
+                            && hit["i"] == 12
+                            && hit["sha256"] == expected_sha
+                    }),
+                    "Known positive hit missing"
+                );
+
+                println!("OFFICIAL_POSITIVE_SHA256=OK");
+            }
+
+            println!(
+                "OFFICIAL_CASE={} LEGACY_S={:.6} OPTIMIZED_S={:.6} SPEEDUP={:.3}x HITS={} EQUIVALENCE=OK",
+                name,
+                legacy_s,
+                optimized_s,
+                legacy_s / optimized_s,
+                optimized["hits"].as_array().unwrap().len()
+            );
+        }
+
+        println!("OFFICIAL_SMALL_PACKAGE_ALL_CASES=OK");
+    }
+
+    #[test]
+    fn offline_dispatch_selects_requested_engine() {
+        let work = fixture("OFFLINE-DISPATCH", 30, 31, true, true, true, 101, 3);
+
+        let config = cfg();
+
+        let selected = true;
+
+        let actual = official_compute_work_unit_payload(&work, &config).unwrap();
+
+        let reference = if selected {
+            official_compute_work_unit_payload_optimized(&work, &config).unwrap()
+        } else {
+            official_compute_work_unit_payload_legacy(&work, &config).unwrap()
+        };
+
+        assert_eq!(
+            normalize(actual),
+            normalize(reference),
+            "Dispatcher returned a different payload"
+        );
+
+        println!(
+            "OFFLINE_DISPATCH=OK SELECTED={}",
+            if selected { "OPTIMIZED" } else { "LEGACY" }
+        );
+    }
+
+    #[test]
+    fn small_official_regression() {
+        compare("SMALL_N_AND_D", 30, 31, true, true, false, 1, 0);
+
+        compare("SMALL_ARBITRARY_CRT", 30, 31, true, true, true, 101, 3);
+
+        compare("SMALL_D_ONLY", 30, 25, false, true, true, 77, 13);
+
+        println!("SMALL_CASES=OK");
+    }
+
+    #[test]
+    #[ignore]
+    fn large_official_scale_regression() {
+        // Circa 2000 cifre: il crivello viene attivato.
+        compare("2000_N_NO_CRT", 1000, 500, true, false, false, 1, 0);
+
+        compare("2000_N_ARBITRARY_CRT", 1000, 500, true, false, true, 101, 3);
+
+        // Le prove successive controllano soprattutto
+        // equivalenza e compatibilita su grandi numeri.
+        compare("5000_N", 2500, 40, true, false, false, 1, 0);
+
+        compare(
+            "5000_N_AND_D_ARBITRARY_CRT",
+            2500,
+            25,
+            true,
+            true,
+            true,
+            101,
+            3,
+        );
+
+        compare("10000_N_AND_D", 5000, 6, true, true, false, 1, 0);
+
+        compare("10000_N_ARBITRARY_CRT", 5000, 6, true, false, true, 101, 3);
+
+        println!("LARGE_SCALE_CASES=OK");
+    }
+}
+
+#[cfg(test)]
+mod private_sieve_reuse_25_lab {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "Run explicitly: isolated 25-package benchmark"]
+    fn compare_fresh_shared_and_persistent_sieve() {
+        const PACKAGES: usize = 8;
+        const PACKAGE_SIZE: usize = 25;
+
+        // Ordine non consecutivo: simula pacchetti
+        // distribuiti che arrivano fuori sequenza.
+        const RANDOM_ORDER: [usize; PACKAGES] = [3, 0, 7, 1, 5, 2, 6, 4];
+
+        let limit = std::env::var("MAX_PRIME_SIEVE_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(500_000);
+
+        assert!((100..=5_000_000).contains(&limit));
+
+        let n0 = parse_ubig_decimal("lab n0", &format!("2{}", "0".repeat(999))).unwrap();
+
+        let m = UBig::from(101u32);
+        let r = UBig::from(3u32);
+
+        let base = &r + &m * &n0;
+        let step = &m * UBig::from(17u32);
+
+        let total = PACKAGES * PACKAGE_SIZE;
+
+        println!("SIEVE_REUSE_25_LAB=START");
+        println!("packages={PACKAGES}");
+        println!("package_size={PACKAGE_SIZE}");
+        println!("positions={total}");
+        println!("sieve_limit={limit}");
+        println!(
+            "initial_N_digits={}",
+            decimal_digits(&n_candidate_from_n(&base))
+        );
+
+        let starts: Vec<UBig> = (0..PACKAGES)
+            .map(|w| &base + &step * UBig::from((w * PACKAGE_SIZE) as u64))
+            .collect();
+
+        println!("=== PRIME TABLE ===");
+
+        let table_started = Instant::now();
+        let primes = crtcomp_primes_up_to(limit);
+        let table_s = table_started.elapsed().as_secs_f64();
+
+        println!("prime_count={}", primes.len());
+        println!("prime_table_s={table_s:.6}");
+
+        println!("=== FRESH SIEVE PER PACKAGE ===");
+
+        let fresh_started = Instant::now();
+
+        let fresh: Vec<Vec<bool>> = starts
+            .iter()
+            .map(|start| {
+                let schedule = crtcomp_compile_schedule(&primes, &step, false);
+
+                crtcomp_mark_compiled(PACKAGE_SIZE, start, &schedule)
+            })
+            .collect();
+
+        let fresh_s = fresh_started.elapsed().as_secs_f64();
+
+        println!("fresh_compile_and_mark_s={fresh_s:.6}");
+
+        println!("=== SHARED SCHEDULE: RANDOM ORDER ===");
+
+        let shared_started = Instant::now();
+
+        let schedule = crtcomp_compile_schedule(&primes, &step, false);
+
+        let shared_build_s = shared_started.elapsed().as_secs_f64();
+
+        let shared_mark_started = Instant::now();
+
+        let mut random_masks = vec![Vec::<bool>::new(); PACKAGES];
+
+        for &window in &RANDOM_ORDER {
+            random_masks[window] = crtcomp_mark_compiled(PACKAGE_SIZE, &starts[window], &schedule);
+        }
+
+        let shared_mark_s = shared_mark_started.elapsed().as_secs_f64();
+
+        assert_eq!(fresh, random_masks, "Random-order shared schedule differs");
+
+        println!("shared_schedule_build_s={shared_build_s:.6}");
+        println!("shared_random_mark_s={shared_mark_s:.6}");
+
+        println!("RANDOM_ORDER_MASKS_EQUAL=YES");
+
+        println!("=== PERSISTENT: CONSECUTIVE WINDOWS ===");
+
+        let persistent_started = Instant::now();
+
+        let mut persistent_state = crtcomp_initialize_persistent_state(&base, &schedule);
+
+        let persistent_init_s = persistent_started.elapsed().as_secs_f64();
+
+        let persistent_mark_started = Instant::now();
+
+        let persistent_masks: Vec<Vec<bool>> = (0..PACKAGES)
+            .map(|_| crtcomp_mark_persistent(PACKAGE_SIZE, &schedule, &mut persistent_state))
+            .collect();
+
+        let persistent_mark_s = persistent_mark_started.elapsed().as_secs_f64();
+
+        assert_eq!(fresh, persistent_masks, "Persistent masks differ");
+
+        println!("persistent_state_init_s={persistent_init_s:.6}");
+        println!("persistent_mark_s={persistent_mark_s:.6}");
+
+        println!("PERSISTENT_MASKS_EQUAL=YES");
+
+        println!("=== COUNT SURVIVORS ===");
+
+        let rejected = fresh.iter().flatten().filter(|&&bad| bad).count();
+
+        let survivors = total - rejected;
+
+        println!("rejected={rejected}");
+        println!("survivors={survivors}");
+
+        println!("=== MILLER-RABIN EQUIVALENCE ===");
+
+        // Riferimento senza crivello:
+        // tutti i 200 candidati vengono verificati.
+        let baseline_started = Instant::now();
+
+        let mut baseline_hits = Vec::new();
+
+        for i in 0..total {
+            let effective = &base + &step * UBig::from(i as u64);
+
+            let candidate = n_candidate_from_n(&effective);
+
+            if is_probable_prime_ring_max(&candidate) {
+                baseline_hits.push((i, sha256_decimal(&candidate)));
+            }
+        }
+
+        let baseline_mr_s = baseline_started.elapsed().as_secs_f64();
+
+        // Stessi 200 indici: saltiamo soltanto
+        // quelli eliminati dal crivello.
+        let survivor_started = Instant::now();
+
+        let mut sieved_hits = Vec::new();
+
+        for i in 0..total {
+            if fresh[i / PACKAGE_SIZE][i % PACKAGE_SIZE] {
+                continue;
+            }
+
+            let effective = &base + &step * UBig::from(i as u64);
+
+            let candidate = n_candidate_from_n(&effective);
+
+            if is_probable_prime_ring_max(&candidate) {
+                sieved_hits.push((i, sha256_decimal(&candidate)));
+            }
+        }
+
+        let survivor_mr_s = survivor_started.elapsed().as_secs_f64();
+
+        assert_eq!(baseline_hits, sieved_hits, "Hit indices or SHA-256 differ");
+
+        println!("baseline_mr_s={baseline_mr_s:.6}");
+        println!("survivors_mr_s={survivor_mr_s:.6}");
+        println!("hits={}", baseline_hits.len());
+        println!("HITS_AND_SHA256_EQUAL=YES");
+
+        println!("=== COST MODEL FOR 8 PACKAGES ===");
+
+        let fresh_total = table_s + fresh_s + survivor_mr_s;
+
+        let shared_random_total = table_s + shared_build_s + shared_mark_s + survivor_mr_s;
+
+        let persistent_total =
+            table_s + shared_build_s + persistent_init_s + persistent_mark_s + survivor_mr_s;
+
+        println!("fresh_total_model_s={fresh_total:.6}");
+        println!("shared_random_total_model_s={shared_random_total:.6}");
+        println!("persistent_total_model_s={persistent_total:.6}");
+        println!("no_sieve_model_s={baseline_mr_s:.6}");
+
+        println!(
+            "fresh_over_shared_random={:.6}x",
+            fresh_total / shared_random_total
+        );
+
+        println!(
+            "fresh_over_persistent={:.6}x",
+            fresh_total / persistent_total
+        );
+
+        println!(
+            "no_sieve_over_shared_random={:.6}x",
+            baseline_mr_s / shared_random_total
+        );
+
+        println!(
+            "no_sieve_over_persistent={:.6}x",
+            baseline_mr_s / persistent_total
+        );
+
+        println!("ALL_MASKS_EQUAL=YES");
+        println!("SIEVE_REUSE_25_LAB=OK");
+        println!("NOTE: isolated cost model, not official GUI timing");
+        println!("NOTE: memory cache cannot survive separate CLI processes");
     }
 }
