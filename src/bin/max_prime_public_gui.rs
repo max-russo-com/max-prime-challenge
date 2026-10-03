@@ -864,6 +864,8 @@ impl MaxPrimeGuiApp {
                 || t.starts_with("Saved to:")
                 || t.starts_with("GUI state saved to:")
                 || t.starts_with("Hit found:")
+                || t.starts_with("MAX optimized engine:")
+                || t.starts_with("MAX structural sieve:")
             {
                 useful_lines.push(t.to_string());
             }
@@ -911,6 +913,7 @@ impl MaxPrimeGuiApp {
         );
 
         thread::spawn(move || {
+            let run_started = std::time::Instant::now();
             let mut child = match Command::new("./target/release/max_prime_public_client")
                 .args(["advanced-local", &config_path])
                 .stdout(Stdio::piped())
@@ -955,6 +958,13 @@ impl MaxPrimeGuiApp {
                         raw.push_str(&stderr);
                     }
                     let summary = Self::summarize_advanced_run_output_gui(&raw, stopped);
+
+                    let summary = format!(
+                        "{}\n\nElapsed wall-clock: {:.3} s",
+                        summary,
+                        run_started.elapsed().as_secs_f64()
+                    );
+
                     let _ = tx.send(summary);
                 }
                 Err(e) => {
@@ -3346,6 +3356,7 @@ https://www.max-russo.com
                     n, display_total
                 ));
 
+                let package_started = std::time::Instant::now();
                 let mut child = match Command::new(&client_path)
                     .arg("official-run-once")
                     .arg(&challenge_id)
@@ -3489,6 +3500,18 @@ https://www.max-russo.com
                         let _ = tx.send(format!("__LOG__\nSTDERR:\n{}\n", stderr_text));
                     }
                 }
+
+                let package_seconds = package_started.elapsed().as_secs_f64();
+
+                let _ = tx.send(format!(
+                    "__LOG__Package {} wall-clock: {:.3} s (includes network)\n",
+                    n, package_seconds
+                ));
+
+                let _ = tx.send(format!(
+                    "__STREAM__   → package elapsed: {:.3} s (includes network)\n",
+                    package_seconds
+                ));
 
                 let (current, compact, hit_details) =
                     Self::summarize_official_output_gui(&combined, n, count);
@@ -4019,7 +4042,7 @@ impl eframe::App for MaxPrimeGuiApp {
                             .size(22.0)
                             .strong(),
                     );
-                    Self::prime_badge_gui(ui, "Public Client", "blue");
+                    Self::prime_badge_gui(ui, "MAX OPTIMIZED", "ok");
                     Self::prime_badge_gui(ui, "Rust", "ok");
 
                     ui.separator();
